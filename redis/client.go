@@ -326,3 +326,71 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	return nil
 }
+
+// Config returns the configuration used for this client
+func (c *Client) Config() Config {
+	return c.pool.cfg
+}
+
+// PubSubMessage represents a message from Redis Pub/Sub
+type PubSubMessage struct {
+	Type    string // "subscribe", "psubscribe", "message", "pmessage", "unsubscribe", "punsubscribe"
+	Pattern string // For pmessage/punsubscribe
+	Channel string
+	Data    string
+}
+
+// ReadPubSubMessage reads the next Pub/Sub message from a dedicated subscription connection.
+// This should only be called on a connection that has already subscribed.
+// Note: This uses a dedicated connection from the pool.
+func (c *Client) ReadPubSubMessage(ctx context.Context) (*PubSubMessage, error) {
+	conn, err := c.pool.Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Don't return connection to pool - it's used for subscription
+
+	// Read the next array response
+	resp, err := conn.reader.ReadValue()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	arr, err := resp.AsArray()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(arr) < 3 {
+		return nil, fmt.Errorf("invalid pub/sub message format")
+	}
+
+	msgType, _ := arr[0].AsString()
+
+	msg := &PubSubMessage{
+		Type: msgType,
+	}
+
+	switch msgType {
+	case "message":
+		msg.Channel, _ = arr[1].AsString()
+		msg.Data, _ = arr[2].AsString()
+	case "pmessage":
+		if len(arr) >= 4 {
+			msg.Pattern, _ = arr[1].AsString()
+			msg.Channel, _ = arr[2].AsString()
+			msg.Data, _ = arr[3].AsString()
+		}
+	case "subscribe", "psubscribe", "unsubscribe", "punsubscribe":
+		msg.Channel, _ = arr[1].AsString()
+	}
+
+	return msg, nil
+}
+
+// GetDedicatedConn gets a connection for dedicated use (like Pub/Sub)
+// The caller is responsible for closing this connection.
+func (c *Client) GetDedicatedConn(ctx context.Context) (*Conn, error) {
+	return c.pool.Get(ctx)
+}
