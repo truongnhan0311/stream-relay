@@ -85,6 +85,64 @@ type ChannelRule struct {
 - [ ] Sticky sessions support
 - [ ] Consistent hashing for room distribution
 
+## 🔥 Horizontal Scaling (Priority)
+
+### Redis Pub/Sub Sync Between Nodes
+
+When running multiple StreamRelay servers, messages need to sync between them.
+
+**Current state**: Single server only - all users must connect to same server.
+
+**Goal**: Multiple servers can handle the same rooms, messages sync via Redis Pub/Sub.
+
+```
+Server 1 (10K users)  ───┐
+                         │
+Server 2 (10K users)  ───┼───▶ Redis Pub/Sub ───▶ All servers receive
+                         │
+Server 3 (10K users)  ───┘
+```
+
+**Implementation needed**:
+
+1. [ ] Add `Broker` interface for inter-node communication
+2. [ ] Implement `RedisBroker` using Redis PUBLISH/SUBSCRIBE
+3. [ ] When `Relay.Publish()` is called:
+   - Write to Redis Stream (existing - for persistence)
+   - PUBLISH to Redis Pub/Sub channel (new - for sync)
+4. [ ] Each Relay instance subscribes to pattern `sr:pub:*`
+5. [ ] On receiving pub/sub message, broadcast to local subscribers only
+6. [ ] Add node ID to avoid echo (don't re-broadcast own messages)
+
+**Proposed API**:
+
+```go
+type Broker interface {
+    Publish(ctx context.Context, channel string, data []byte) error
+    Subscribe(ctx context.Context, pattern string) (<-chan BrokerMessage, error)
+}
+
+type RedisBroker struct {
+    client *redis.Client
+    nodeID string // To filter own messages
+}
+
+// Usage:
+relay, _ := streamrelay.NewWithOptions(
+    streamrelay.WithRedisAddr("localhost:6379"),
+    streamrelay.WithBroker(redisBroker),  // Enable multi-node sync
+)
+```
+
+**Pub/Sub message format**:
+```json
+{
+    "node": "node-1",
+    "room": "chat:general", 
+    "data": {...message...}
+}
+```
+
 ### Monitoring
 - [ ] Prometheus metrics export
 - [ ] Health check endpoint

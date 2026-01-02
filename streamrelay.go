@@ -168,6 +168,20 @@ type (
 
 	// Transport is the interface for sending data
 	Transport = engine.Transport
+
+	// --- Memory Relay (Redis-free) ---
+
+	// MemoryRelay is an in-memory relay without Redis dependency
+	MemoryRelay = engine.MemoryRelay
+
+	// MemoryRoom is an in-memory room
+	MemoryRoom = engine.MemoryRoom
+
+	// MemoryConfig contains configuration for MemoryRelay
+	MemoryConfig = engine.MemoryConfig
+
+	// RingBuffer is a circular buffer for message history
+	RingBuffer = engine.RingBuffer
 )
 
 // Re-export constants and types
@@ -234,6 +248,26 @@ var (
 
 	// GenerateDMRoomID creates a consistent DM room ID
 	GenerateDMRoomID = engine.GenerateDMRoomID
+
+	// --- Memory Relay (Redis-free) ---
+
+	// NewMemoryRelay creates a new in-memory relay (no Redis required)
+	NewMemoryRelay = engine.NewMemoryRelay
+
+	// DefaultMemoryConfig returns default memory relay configuration
+	DefaultMemoryConfig = engine.DefaultMemoryConfig
+
+	// NewRingBuffer creates a new ring buffer for message history
+	NewRingBuffer = engine.NewRingBuffer
+
+	// ParseMessageID extracts timestamp from message ID
+	ParseMessageID = engine.ParseMessageID
+
+	// CompareMessageIDs compares two message IDs
+	CompareMessageIDs = engine.CompareMessageIDs
+
+	// GenerateMessageIDFromTime creates a message ID from time
+	GenerateMessageIDFromTime = engine.GenerateMessageIDFromTime
 )
 
 // Re-export option functions
