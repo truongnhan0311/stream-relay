@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,9 +27,10 @@ type Broker interface {
 
 // BrokerMessage is a message received from the broker
 type BrokerMessage struct {
-	Channel string
-	Data    []byte
-	NodeID  string // Source node ID
+	Channel   string
+	Data      []byte
+	NodeID    string // Source node ID
+	MessageID string // For deduplication
 }
 
 // NodeMessage is the message format sent between nodes
@@ -43,19 +45,109 @@ type NodeMessage struct {
 	Timestamp int64             `json:"timestamp"`
 }
 
-// RedisBroker implements Broker using Redis Pub/Sub for multi-node sync.
-// This enables horizontal scaling across multiple StreamRelay servers.
-type RedisBroker struct {
-	client   *redis.Client
-	nodeID   string
-	prefix   string
-	subConn  *redis.Client // Dedicated connection for subscriptions
-	handlers map[string]func(BrokerMessage)
+// --- Deduplication Cache ---
+
+// DedupeCache tracks recently seen message IDs to prevent duplicates
+type DedupeCache struct {
+	cache    map[string]time.Time
+	order    *list.List // LRU order
+	elements map[string]*list.Element
+	maxSize  int
+	ttl      time.Duration
 	mu       sync.RWMutex
-	ctx      context.Context
-	cancel   context.CancelFunc
-	running  atomic.Bool
-	msgChan  chan BrokerMessage
+}
+
+// NewDedupeCache creates a new deduplication cache
+func NewDedupeCache(maxSize int, ttl time.Duration) *DedupeCache {
+	if maxSize <= 0 {
+		maxSize = 10000
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return &DedupeCache{
+		cache:    make(map[string]time.Time),
+		order:    list.New(),
+		elements: make(map[string]*list.Element),
+		maxSize:  maxSize,
+		ttl:      ttl,
+	}
+}
+
+// IsDuplicate checks if message ID was seen recently, and marks it as seen
+func (d *DedupeCache) IsDuplicate(messageID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Check if exists and not expired
+	if ts, exists := d.cache[messageID]; exists {
+		if time.Since(ts) < d.ttl {
+			return true // Duplicate
+		}
+		// Expired, remove old entry
+		if elem, ok := d.elements[messageID]; ok {
+			d.order.Remove(elem)
+			delete(d.elements, messageID)
+		}
+	}
+
+	// Add to cache
+	d.cache[messageID] = time.Now()
+	elem := d.order.PushBack(messageID)
+	d.elements[messageID] = elem
+
+	// Evict old entries if over size
+	for d.order.Len() > d.maxSize {
+		oldest := d.order.Front()
+		if oldest != nil {
+			oldID := oldest.Value.(string)
+			d.order.Remove(oldest)
+			delete(d.elements, oldID)
+			delete(d.cache, oldID)
+		}
+	}
+
+	return false
+}
+
+// Cleanup removes expired entries
+func (d *DedupeCache) Cleanup() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now()
+	for id, ts := range d.cache {
+		if now.Sub(ts) > d.ttl {
+			if elem, ok := d.elements[id]; ok {
+				d.order.Remove(elem)
+				delete(d.elements, id)
+			}
+			delete(d.cache, id)
+		}
+	}
+}
+
+// --- Redis Broker ---
+
+// RedisBroker implements Broker using Redis Pub/Sub for multi-node sync.
+// Features:
+// - Message deduplication to prevent double delivery
+// - Automatic reconnection on failure
+// - Configurable retry policy
+type RedisBroker struct {
+	client     *redis.Client
+	nodeID     string
+	prefix     string
+	subConn    *redis.Client
+	handlers   map[string]func(BrokerMessage)
+	mu         sync.RWMutex
+	ctx        context.Context
+	cancel     context.CancelFunc
+	running    atomic.Bool
+	msgChan    chan BrokerMessage
+	dedupe     *DedupeCache
+	maxRetries int
+	retryDelay time.Duration
 }
 
 // RedisBrokerConfig contains configuration for RedisBroker
@@ -71,6 +163,18 @@ type RedisBrokerConfig struct {
 
 	// BufferSize for the message channel (default: 1000)
 	BufferSize int
+
+	// DedupeSize is max message IDs to track (default: 10000)
+	DedupeSize int
+
+	// DedupeTTL is how long to remember message IDs (default: 5 min)
+	DedupeTTL time.Duration
+
+	// MaxRetries for publish failures (default: 3)
+	MaxRetries int
+
+	// RetryDelay between retries (default: 100ms)
+	RetryDelay time.Duration
 }
 
 // NewRedisBroker creates a new Redis-based broker for cluster communication
@@ -91,17 +195,48 @@ func NewRedisBroker(cfg RedisBrokerConfig) (*RedisBroker, error) {
 		cfg.BufferSize = 1000
 	}
 
+	if cfg.MaxRetries <= 0 {
+		cfg.MaxRetries = 3
+	}
+
+	if cfg.RetryDelay <= 0 {
+		cfg.RetryDelay = 100 * time.Millisecond
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &RedisBroker{
-		client:   cfg.Client,
-		nodeID:   cfg.NodeID,
-		prefix:   cfg.Prefix,
-		handlers: make(map[string]func(BrokerMessage)),
-		ctx:      ctx,
-		cancel:   cancel,
-		msgChan:  make(chan BrokerMessage, cfg.BufferSize),
-	}, nil
+	broker := &RedisBroker{
+		client:     cfg.Client,
+		nodeID:     cfg.NodeID,
+		prefix:     cfg.Prefix,
+		handlers:   make(map[string]func(BrokerMessage)),
+		ctx:        ctx,
+		cancel:     cancel,
+		msgChan:    make(chan BrokerMessage, cfg.BufferSize),
+		dedupe:     NewDedupeCache(cfg.DedupeSize, cfg.DedupeTTL),
+		maxRetries: cfg.MaxRetries,
+		retryDelay: cfg.RetryDelay,
+	}
+
+	// Start cleanup goroutine
+	go broker.cleanupLoop()
+
+	return broker, nil
+}
+
+// cleanupLoop periodically cleans expired dedup entries
+func (b *RedisBroker) cleanupLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-ticker.C:
+			b.dedupe.Cleanup()
+		}
+	}
 }
 
 // NodeID returns this broker's node ID
@@ -110,6 +245,7 @@ func (b *RedisBroker) NodeID() string {
 }
 
 // Publish sends a message to all nodes in the cluster via Redis Pub/Sub
+// Includes retry logic for reliability
 func (b *RedisBroker) Publish(ctx context.Context, channel string, data []byte) error {
 	pubChannel := b.prefix + channel
 
@@ -127,16 +263,35 @@ func (b *RedisBroker) Publish(ctx context.Context, channel string, data []byte) 
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	_, err = b.client.Do(ctx, "PUBLISH", pubChannel, string(payload))
-	return err
+	// Retry logic
+	var lastErr error
+	for attempt := 0; attempt < b.maxRetries; attempt++ {
+		_, err = b.client.Do(ctx, "PUBLISH", pubChannel, string(payload))
+		if err == nil {
+			return nil // Success
+		}
+		lastErr = err
+
+		// Check if context is cancelled
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Wait before retry
+		if attempt < b.maxRetries-1 {
+			time.Sleep(b.retryDelay * time.Duration(attempt+1))
+		}
+	}
+
+	return fmt.Errorf("publish failed after %d retries: %w", b.maxRetries, lastErr)
 }
 
-// PublishMessage publishes a Message to the cluster
+// PublishMessage publishes a Message to the cluster with deduplication ID
 func (b *RedisBroker) PublishMessage(ctx context.Context, msg *Message) error {
 	nodeMsg := NodeMessage{
 		NodeID:    b.nodeID,
 		RoomID:    msg.RoomID,
-		MessageID: msg.ID,
+		MessageID: msg.ID, // This is the dedup key
 		SenderID:  msg.SenderID,
 		Type:      string(msg.Type),
 		Content:   msg.Content,
@@ -173,11 +328,13 @@ func (b *RedisBroker) Subscribe(ctx context.Context, pattern string) (<-chan Bro
 	return b.msgChan, nil
 }
 
-// subscriptionLoop handles the Redis PSUBSCRIBE
+// subscriptionLoop handles the Redis PSUBSCRIBE with auto-reconnect
 func (b *RedisBroker) subscriptionLoop(pattern string) {
 	defer b.running.Store(false)
 
 	fullPattern := b.prefix + pattern
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 10
 
 	for {
 		select {
@@ -189,11 +346,29 @@ func (b *RedisBroker) subscriptionLoop(pattern string) {
 		// Subscribe to pattern
 		_, err := b.subConn.Do(b.ctx, "PSUBSCRIBE", fullPattern)
 		if err != nil {
-			time.Sleep(time.Second)
+			consecutiveErrors++
+			backoff := time.Duration(consecutiveErrors) * time.Second
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			time.Sleep(backoff)
+
+			// Try to reconnect
+			if consecutiveErrors >= maxConsecutiveErrors {
+				// Create new connection
+				newConn, err := redis.NewClient(b.client.Config())
+				if err == nil {
+					b.subConn.Close()
+					b.subConn = newConn
+					consecutiveErrors = 0
+				}
+			}
 			continue
 		}
 
-		// Read messages
+		consecutiveErrors = 0
+
+		// Read messages loop
 		for {
 			select {
 			case <-b.ctx.Done():
@@ -226,15 +401,27 @@ func (b *RedisBroker) subscriptionLoop(pattern string) {
 				continue
 			}
 
+			// Parse inner message to get ID for deduplication
+			var nodeMsg NodeMessage
+			if err := json.Unmarshal(wrapped.Data, &nodeMsg); err != nil {
+				continue
+			}
+
+			// Check for duplicate
+			if b.dedupe.IsDuplicate(nodeMsg.MessageID) {
+				continue // Already processed
+			}
+
 			// Send to channel
 			select {
 			case b.msgChan <- BrokerMessage{
-				Channel: msgResp.Channel,
-				Data:    wrapped.Data,
-				NodeID:  wrapped.NodeID,
+				Channel:   msgResp.Channel,
+				Data:      wrapped.Data,
+				NodeID:    wrapped.NodeID,
+				MessageID: nodeMsg.MessageID,
 			}:
 			default:
-				// Channel full, drop message
+				// Channel full, drop message (it's in Redis Stream anyway)
 			}
 		}
 	}
@@ -255,6 +442,10 @@ func (b *RedisBroker) Close() error {
 // --- Cluster-aware Relay ---
 
 // ClusterRelay extends Relay with multi-node support via Redis Pub/Sub
+// Features:
+// - Automatic message sync between nodes
+// - Deduplication prevents double delivery
+// - Graceful handling of pub/sub failures
 type ClusterRelay struct {
 	*Relay
 	broker *RedisBroker
@@ -272,6 +463,12 @@ type ClusterConfig struct {
 
 	// BrokerPrefix for pub/sub channels
 	BrokerPrefix string
+
+	// DedupeSize is max message IDs to track (default: 10000)
+	DedupeSize int
+
+	// DedupeTTL is how long to remember message IDs (default: 5 min)
+	DedupeTTL time.Duration
 }
 
 // NewClusterRelay creates a new cluster-aware relay
@@ -282,11 +479,13 @@ func NewClusterRelay(cfg ClusterConfig) (*ClusterRelay, error) {
 		return nil, err
 	}
 
-	// Create broker
+	// Create broker with deduplication
 	broker, err := NewRedisBroker(RedisBrokerConfig{
-		Client: relay.Client(),
-		NodeID: cfg.NodeID,
-		Prefix: cfg.BrokerPrefix,
+		Client:     relay.Client(),
+		NodeID:     cfg.NodeID,
+		Prefix:     cfg.BrokerPrefix,
+		DedupeSize: cfg.DedupeSize,
+		DedupeTTL:  cfg.DedupeTTL,
 	})
 	if err != nil {
 		relay.Close()
@@ -352,17 +551,33 @@ func (cr *ClusterRelay) handleBrokerMessage(bMsg BrokerMessage) {
 }
 
 // Publish sends a message to a room and syncs to cluster
+// If pub/sub fails, message is still in Redis Stream for recovery
 func (cr *ClusterRelay) Publish(ctx context.Context, roomID string, msg *Message, opts *PublishOptions) ([]DeliveryResult, error) {
 	// First, publish locally (this persists to Redis Stream)
+	// This is the source of truth - if this succeeds, message is safe
 	results, err := cr.Relay.Publish(ctx, roomID, msg, opts)
 	if err != nil {
 		return nil, err
 	}
 
 	// Then, broadcast to other nodes via Pub/Sub
-	if err := cr.broker.PublishMessage(ctx, msg); err != nil {
-		// Log but don't fail - local publish succeeded
-		// Other nodes will eventually get the message from Redis Stream
+	// If this fails, other nodes will still get the message from Redis Stream
+	// when they read from the stream (eventual consistency)
+	if pubErr := cr.broker.PublishMessage(ctx, msg); pubErr != nil {
+		// Log but don't fail - message is already in Redis Stream
+		// Other nodes will get it via stream recovery
+		if cr.Relay.eventHandler != nil {
+			cr.Relay.eventHandler(&Event{
+				Type:      EventTypeError,
+				RoomID:    roomID,
+				Timestamp: time.Now(),
+				Data: map[string]interface{}{
+					"error":      "pubsub_publish_failed",
+					"message_id": msg.ID,
+					"details":    pubErr.Error(),
+				},
+			})
+		}
 	}
 
 	return results, nil
