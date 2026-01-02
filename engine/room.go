@@ -71,7 +71,7 @@ func (r *Room) Subscribe(sub Subscriber, info *PresenceInfo) error {
 	r.presence[userID] = info
 
 	// Emit subscribe event
-	if r.relay.eventHandler != nil {
+	if r.relay != nil && r.relay.eventHandler != nil {
 		r.relay.eventHandler(&Event{
 			Type:      EventTypeSubscribe,
 			RoomID:    r.config.ID,
@@ -95,7 +95,7 @@ func (r *Room) Unsubscribe(userID string) error {
 		r.lastActive = time.Now()
 
 		// Emit unsubscribe event
-		if r.relay.eventHandler != nil {
+		if r.relay != nil && r.relay.eventHandler != nil {
 			r.relay.eventHandler(&Event{
 				Type:      EventTypeUnsubscribe,
 				RoomID:    r.config.ID,
@@ -291,7 +291,7 @@ func (r *Room) safeDeliver(ctx context.Context, userID string, sub Subscriber, m
 			}
 
 			// Emit error event
-			if r.relay.eventHandler != nil {
+			if r.relay != nil && r.relay.eventHandler != nil {
 				r.relay.eventHandler(&Event{
 					Type:      EventTypeError,
 					RoomID:    r.config.ID,
@@ -377,7 +377,7 @@ func (r *Room) listenLoop(ctx context.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			// Emit error event
-			if r.relay.eventHandler != nil {
+			if r.relay != nil && r.relay.eventHandler != nil {
 				r.relay.eventHandler(&Event{
 					Type:      EventTypeError,
 					RoomID:    r.config.ID,
@@ -425,7 +425,7 @@ func (r *Room) listenLoop(ctx context.Context) {
 
 				// Emit error event after too many consecutive errors
 				if consecutiveErrors >= maxConsecutiveErrors {
-					if r.relay.eventHandler != nil {
+					if r.relay != nil && r.relay.eventHandler != nil {
 						r.relay.eventHandler(&Event{
 							Type:      EventTypeError,
 							RoomID:    r.config.ID,
